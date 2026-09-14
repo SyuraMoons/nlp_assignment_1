@@ -1,0 +1,14 @@
+requests
+beautifulsoup4
+lxml
+python-dateutil
+pyyaml
+pandas
+tqdm
+transformers
+torch
+google-cloud-bigquery
+db-dtypes
+pyarrow
+matplotlib
+jupyter
