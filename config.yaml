@@ -1,0 +1,93 @@
+# Shared config for GDELT acquisition, filtering, scraping, and sentiment scoring.
+
+# GCP project used to run BigQuery queries against GDELT's public dataset (billing/
+# quota attribution -- the dataset itself is free to query). Must have the BigQuery
+# API enabled. Leave blank to fall back to the GOOGLE_CLOUD_PROJECT env var.
+gcp_project: "nlpassignment-508617"
+
+date_range:
+  start: "2021-09-01"
+  end: "2026-09-14"
+
+timezone: "Asia/Jakarta"  # IDR trades in Jakarta; all "daily" aggregation uses WIB calendar days
+
+sites:
+  - kontan
+  - bisnis
+  - cnbc_indonesia
+
+gdelt:
+  table: "gdelt-bq.gdeltv2.gkg_partitioned"
+  id_domains:
+    - "kontan.co.id"
+    - "bisnis.com"
+    - "cnbcindonesia.com"
+  # Global English geopolitical coverage for FinBERT, so the pipeline reflects the
+  # hypothesis's "global" scope and not just Indonesian reporting.
+  global_sources:
+    - "reuters.com"
+    - "apnews.com"
+    - "bbc.co.uk"
+    - "aljazeera.com"
+    - "cnbc.com"
+    - "theguardian.com"
+    - "nytimes.com"
+    - "ft.com"
+    - "wsj.com"
+    - "bloomberg.com"
+  global_theme_prefixes:
+    - "ARMEDCONFLICT"
+    - "SANCTIONS"
+    - "MILITARY"
+    - "TAX_FNCACT_PRESIDENT"
+    - "EPU_"
+    - "ECON_TRADE"
+
+# Sections/channels considered macro, market, or international news -- other sections
+# (lifestyle, sports, entertainment, ...) are dropped before scraping. Subdomain for
+# Kontan, URL path segment after the domain for Bisnis and CNBC Indonesia.
+sections:
+  kontan:
+    - "nasional"
+    - "internasional"
+    - "keuangan"
+    - "investasi"
+  bisnis:
+    - "ekonomi"
+    - "market"
+    - "kabar24"
+  cnbc_indonesia:
+    - "news"
+    - "market"
+    - "research"
+
+# GDELT GKG theme prefixes considered relevant to geopolitics/macro/FX. This is a
+# starting list for the team to review against real filter output (see
+# notebooks/01_news_eda.ipynb) and tune -- it is not meant to be final as shipped.
+relevant_theme_prefixes:
+  - "ECON_"
+  - "EPU_"
+  - "TAX_FNCACT"
+  - "ARMEDCONFLICT"
+  - "SANCTIONS"
+  - "MILITARY"
+  - "TRADE"
+  - "CRISISLEX"
+
+# Per site per WIB day, keep at most this many queued articles for full-text scraping
+# (headline-level sentiment still covers every filtered row, capped or not -- the cap
+# only limits scraping volume/time). Picked deterministically by sorted URL hash so
+# reruns select the same articles.
+daily_cap_per_site: 15
+
+scraping:
+  min_delay_seconds: 1.0
+  max_delay_seconds: 3.0
+  max_retries: 3
+  timeout_seconds: 15
+  user_agent: "Mozilla/5.0 (compatible; NLPCourseProjectBot/1.0; contact: harfiibadurrahman@gmail.com)"
+
+paths:
+  raw_dir: "data/raw"
+  interim_dir: "data/interim"
+  processed_dir: "data/processed"
