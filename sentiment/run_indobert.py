@@ -53,7 +53,7 @@ def score_texts(classifier, texts, batch_size=16):
     signed_scores, hard_labels = [], []
     for i in tqdm(range(0, len(texts), batch_size), desc="scoring"):
         batch = [t[:MAX_CHARS] for t in texts[i:i + batch_size]]
-        results = classifier(batch)
+        results = classifier(batch, truncation=True, max_length=512)
         for scores in results:
             by_label = {s["label"]: s["score"] for s in scores}
             pos = by_label.get(LABEL_POSITIVE, 0.0)
