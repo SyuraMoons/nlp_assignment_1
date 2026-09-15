@@ -314,29 +314,41 @@ Phase 3 addresses the three concrete gaps behind the Phase 2 negative result: to
 little data (news features existed for one year only), a single modality (same-day
 text sentiment, nothing else), and a noisy single-split evaluation.
 
-### Data extension: news features across the full 5-year range
+### Data extension: news features across the full 5-year range (partially completed)
 
-`selection/build_queue.py`, `preprocessing/clean_text.py`,
-`preprocessing/align_dates.py`, `sentiment/run_indobert.py`, `sentiment/build_daily.py`,
-and `analysis/merge_dataset.py` were re-run against all six already-downloaded
+`selection/build_queue.py`, `preprocessing/clean_text.py`, and
+`preprocessing/align_dates.py` were re-run against all six already-downloaded
 `data/raw/gdelt_id_<year>.parquet` files (2021-2026, 492,777 raw GDELT rows) instead
-of just 2024. This is a pipeline-scope fix, not a new data source -- the raw pulls
-already covered the full range; only the filtering/scraping/scoring steps had been
-run for one pilot year (see Phase 2's "Known limitation").
+of just 2024, taking filtered headlines from 55,272 (2024 only) to **245,162**
+(2021-09 to 2026-09). This is a pipeline-scope fix, not a new data source -- the raw
+pulls already covered the full range; only the filtering/scraping/scoring steps had
+been run for one pilot year (see Phase 2's "Known limitation").
 
-- Filtered headlines: 55,272 (2024 only) -> **245,162** (2021-09 to 2026-09).
-- `sentiment/run_indobert.py` now caches previously-scored rows by URL (`--no-cache`
-  to force a full re-score) and scores on `mps` where available, since re-scoring
-  the full set on every rerun would otherwise dominate iteration time.
-- Article **bodies stay 2024-only** (10,633 scraped articles) -- scraping all 5 years
-  of the larger 39,837-URL queue is a multi-day job and out of scope here. Body
-  features (`id_body_sent_mean`, `id_body_count`) are therefore sparse outside 2024;
-  they're kept as optional features (filled 0 when absent) rather than blocking the
-  rest of the range.
-- The Kontan GDELT-coverage gap before 2023-03 (see Phase 1's "Resolved risk") is a
-  real structural break in source mix, not new noise -- `features/text_features.py`'s
-  `id_kontan_count_share` / `id_bisnis_count_share` features isolate it from a genuine
-  change in sentiment or volume.
+`sentiment/run_indobert.py` was updated to cache previously-scored rows by URL
+(`--no-cache` to force a full re-score) and score on `mps` where available, since
+re-scoring the full set on every rerun would otherwise dominate iteration time.
+**Scoring all 245,162 headlines was started but not completed in this pass** --
+IndoBERT throughput on this machine (~15-30 titles/sec, degrading further under
+sustained load) made the full re-score a 1.5-2+ hour job, which time constraints
+didn't allow. **The results below therefore still use the original 55,134 headlines
+scored for 2024-01 through 2025-01 only** -- the same window as Phase 2 -- with the
+market modality and richer text-dynamics/theme features layered on top of that same
+window. Finishing the full re-score (the code is ready and cache-aware; a rerun of
+`sentiment/run_indobert.py` will only need to score the ~190k new rows, not redo the
+55k already cached) is the single highest-value next step, since it would give the
+holdout evaluation below real news coverage instead of none (see the "Critical
+caveat" note under Results).
+
+Article **bodies stay 2024-only** regardless (10,633 scraped articles) -- scraping
+all 5 years of the larger 39,837-URL queue is a multi-day job and out of scope here.
+Body features (`id_body_sent_mean`, `id_body_count`) are therefore sparse outside
+2024; they're kept as optional features (filled 0 when absent) rather than blocking
+the rest of the range.
+
+The Kontan GDELT-coverage gap before 2023-03 (see Phase 1's "Resolved risk") is a
+real structural break in source mix, not new noise -- `features/text_features.py`'s
+`id_kontan_count_share` / `id_bisnis_count_share` features isolate it from a genuine
+change in sentiment or volume.
 
 ### Modality 2: market data (`fx/fetch_market.py`)
 
@@ -412,9 +424,48 @@ python -m features.embed_titles             # optional but required for *_emb fe
 python -m modeling.train_refined
 ```
 
-**Results**: _pending -- `modeling/train_refined.py` is running against the
-newly-extended 5-year dataset; the ablation table and holdout metrics will be filled
-in here once that run completes._
+**Results** (2021-09-01 to 2026-09-10, n=1,299 labeled trading days; walk-forward CV
+on the first 1,104, untouched holdout on the last 195, 2025-12-03 to 2026-09-10;
+holdout positive rate 0.559):
+
+| feature set | model | CV accuracy | CV MCC | holdout accuracy | holdout F1-macro | holdout MCC |
+|---|---|---|---|---|---|---|
+| majority_baseline | - | - | - | 0.559 | 0.359 | 0.000 |
+| persistence_baseline | - | - | - | 0.400 | 0.400 | -0.187 |
+| market_only | LogReg | 0.548 | 0.086 | 0.590 | 0.576 | 0.157 |
+| market_only | LightGBM | 0.529 | 0.049 | 0.574 | 0.547 | 0.114 |
+| text_sentiment_only | LogReg | 0.534 | 0.014 | 0.559 | 0.359 | 0.000 |
+| text_full | LogReg | 0.537 | 0.020 | 0.559 | 0.359 | 0.000 |
+| market_text_sentiment | LogReg | 0.553 | 0.098 | 0.605 | 0.591 | 0.188 |
+| **market_text_full** | **LogReg** | **0.555** | **0.102** | 0.590 | 0.576 | 0.157 |
+| **market_text_full** | **LightGBM** | 0.530 | 0.052 | **0.621** | **0.595** | **0.213** |
+
+(`text_full_emb` / `market_text_full_emb` rows are identical to `text_full` /
+`market_text_full` here -- `features/embed_titles.py` didn't finish downloading its
+model in time, so no embedding columns exist yet; see "Data extension" above.)
+
+**Critical caveat -- read before trusting the holdout numbers**: the holdout window
+(2025-12-03 to 2026-09-10) falls entirely **outside** the only period with real news
+coverage (2024-01 to 2025-01, per the "Data extension" note above). Every text
+feature is exactly 0/flat for every holdout row. That means `market_text_full`'s
+higher holdout accuracy (0.621 vs. `market_only`'s 0.574, both LightGBM) **cannot be
+attributed to news content** -- there is no news signal present in the holdout to
+attribute it to. It reflects noise/variance between two models fit on slightly
+different feature sets, not evidence for the hypothesis.
+
+**The CV numbers are the more meaningful comparison** for now, since the walk-forward
+folds are drawn from the first 1,104 rows (up to 2025-12-02), which do include the
+real 2024 news window. There, `market_text_full` (LogReg) reaches CV accuracy 0.555
+and MCC 0.102 vs. `market_only`'s 0.548 accuracy / 0.086 MCC -- a small improvement,
+consistent with Phase 4's hypothesis test below (not statistically significant, but
+directionally positive). `text_sentiment_only` alone (CV accuracy 0.534, MCC 0.014)
+is barely better than chance and far behind `market_only` -- news alone remains a
+weak signal, matching Phase 2's original negative finding; it only helps when
+combined with market data.
+
+**Bottom line**: finishing the 5-year IndoBERT re-score (data extension above) is
+the single change most likely to produce a real answer here, since it would give the
+holdout period actual news coverage to test against instead of none.
 
 ## Phase 4: Hypothesis Testing, Error Analysis & Final Report
 
@@ -465,14 +516,47 @@ Outputs: data/processed/error_analysis.json
 
 Run with: `python -m analysis.error_analysis`
 
-**Results and report text**: _pending -- both scripts depend on Phase 3's
-`refined_results.json` / `predictions_refined.parquet`, which are still being
-produced. Once they exist, this section will carry the hypothesis-test verdict, the
-error-analysis findings, and the final report text will be drafted for copy-paste
-into the Google Doc._
+**Results** (run against the current 2024-window-scored data -- see Phase 3's
+"Critical caveat"; re-run both scripts once the full 5-year IndoBERT re-score
+finishes to get holdout-period-valid numbers):
+
+- **McNemar's test**: `market_only` -> `market_text_full` (LightGBM) is the closest
+  to significant of the three pairs tested (p=0.078, holdout accuracy 0.574 ->
+  0.621) but doesn't clear p<0.05; the LogReg version and the sentiment-only ->
+  full-text comparison show no difference at all (p=1.0) -- expected, given the
+  holdout has zero news coverage (Phase 3 caveat).
+- **Logistic-regression significance** (fit on the full pre-holdout window, which
+  does include real 2024 news): `id_title_sent_mean` is the one news feature with a
+  statistically significant coefficient (p=0.0087, coef=-0.94 on standardized
+  values) -- notably **negative**, i.e. more-positive same-day headlines associate
+  with USD/IDR strengthening (rupiah direction down) the next day, not weakening.
+  Pseudo-R² is low (0.016), so this is a real but small effect, not a strong
+  predictor on its own -- consistent with the CV-level result above.
+- **Error analysis** (`market_text_full`, LightGBM, on holdout): of 195 holdout days,
+  both models agree 174 times (106 both-right, 68 both-wrong); `market_text_full`
+  uniquely gets 15 right that `market_only` misses, `market_only` uniquely gets 6 --
+  net in `market_text_full`'s favor, but on a holdout with no news features present,
+  this is model variance, not evidence of news adding signal (see Phase 3 caveat
+  again). Feature importance for `market_text_full` is dominated entirely by market
+  columns (USD/THB, VIX, DXY, USD/MYR, Brent lead) -- unsurprising, since text
+  features are constant zero for the whole holdout the model was evaluated on.
+
+**Verdict on the hypothesis, as it stands today**: the data currently available
+supports a **weak, not-yet-significant** version of the hypothesis -- same-day
+Indonesian news sentiment has a real (p<0.01) but small (pseudo-R²=0.016)
+relationship with next-day USD/IDR direction, and adding text features to market
+data nudges cross-validated accuracy and MCC up slightly (0.548->0.555 accuracy,
+0.086->0.102 MCC) without reaching statistical significance in the paired model
+comparison. The apparent 4.7-point holdout accuracy gain is **not valid evidence**
+either way, since the holdout period has no news coverage in the current data. A
+clean re-run after finishing the 5-year IndoBERT re-score (Phase 3) is needed before
+treating any holdout-level number as a real test of the hypothesis.
 
 **Known limitations carried into the final report** (see earlier phases for detail):
 the global/FinBERT half of the hypothesis was never pulled (BigQuery billing never
-enabled), article bodies were only scraped for 2024 (headline-level sentiment covers
-the full 2021-2026 range), Kontan has no GDELT translingual coverage before 2023-03,
-and CNBC Indonesia has no GDELT coverage at all.
+enabled); article bodies were only scraped for 2024; **headline-level sentiment
+scoring also only covers 2024-01 through 2025-01 in this run** -- the extension to
+the full 2021-2026 headline set (245,162 rows, already filtered and ready) was
+started but not completed under time constraints, which is why the holdout window
+above has zero news coverage; Kontan has no GDELT translingual coverage before
+2023-03; and CNBC Indonesia has no GDELT coverage at all.
