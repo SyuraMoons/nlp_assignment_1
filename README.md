@@ -231,8 +231,248 @@ calendar day in the range still gets a row (`is_trading_day=False` on filled day
 the merge with the news table on `date` never drops a date, matching how
 `daily_news_features.csv` already includes every day, news or not.
 
-## Handoff to Person C
+## Final Task 1 dataset
 
-`data/processed/daily_news_features.csv` (Person A) and `data/processed/usd_idr_daily.csv`
-(Person B) are the two Task 1 deliverables: one row per calendar day each, every day
-in the range present in both, ready to `merge(..., on="date")` for the hypothesis test.
+`analysis/merge_dataset.py` joins the news-sentiment features and the USD/IDR rate
+into one dataset:
+
+```
+analysis/merge_dataset.py
+    -> data/processed/merged_dataset.csv
+```
+
+Run with: `python -m analysis.merge_dataset`
+
+`data/processed/merged_dataset.csv` is the Task 1 deliverable: one row per calendar
+day (1840 rows, 2021-09-01 to 2026-09-14), combining `daily_news_features.csv`'s
+sentiment/count columns with `usd_idr_daily.csv`'s exchange-rate columns, ready for
+the modeling/hypothesis-testing tasks later in the course.
+
+## Phase 2: Pipeline Proposal & Baseline Experimentation
+
+`modeling/train_baseline.py` is the first modeling pass on top of the Task 1
+dataset -- a naive baseline plus two standard simple/interpretable classifiers
+(Gaussian Naive Bayes, Logistic Regression), evaluated on a proper chronological
+(no-shuffle) split, before any more advanced modeling.
+
+```
+modeling/train_baseline.py
+    -> data/processed/baseline_results.json
+```
+
+Run with: `python -m modeling.train_baseline`
+
+**Task**: binary classification of next-trading-day USD/IDR direction (up vs.
+down), from same-day Indonesian news-sentiment features. Exact-zero "flat"
+trading days (9 of them) are dropped as a rare, ambiguous third class;
+non-trading days are excluded entirely since their `usd_idr_pct_change` is a
+forward-fill artifact, not a real market move.
+
+**Known limitation that scopes this experiment:** inspecting `merged_dataset.csv`
+by month shows the Indonesian news features (`id_title_count`, etc.) are nonzero
+**only for 2024-01 through 2025-01** -- every other month across the full 5-year
+range has zero articles. This lines up with the pipeline's "pull one pilot year
+first" instructions (see "Running the pipeline" above) never having been scaled
+to the other years. Training on the full 5-year range would therefore mostly
+train on "no news that day" rows, so baseline modeling here is restricted to the
+2024-01-01 -- 2025-01-07 window where news coverage is real. Extending training
+to the full range is future work, pending the rest of the years being pulled/
+scraped/scored the same way 2024 was.
+
+**Features**: `id_title_sent_mean`, `id_title_count`, `id_gdelt_tone_mean`,
+`id_body_sent_mean`, `id_body_count`, `id_bisnis_count`, `id_kontan_count`, plus a
+binary `has_news` indicator (news is missing on ~80% of days even within the 2024
+window, so missing sentiment is filled with 0/neutral rather than dropped).
+`global_*` columns are excluded -- they're all-NaN in this window (see "Known
+limitation" under Person B/global scope above).
+
+**Split**: chronological, last 20% of dates in the window held out as test (train
+on earlier dates, test on later ones) to avoid look-ahead leakage.
+
+**Results** (2024-01-01 to 2025-01-07 window, train=212, test=53,
+test set positive rate=0.566):
+
+| model | accuracy | f1_macro |
+|---|---|---|
+| majority_baseline | 0.566 | 0.361 |
+| gaussian_naive_bayes | 0.415 | 0.356 |
+| logistic_regression | 0.396 | 0.378 |
+
+**Reading the result**: neither classifier beats the trivial majority-class
+baseline on this held-out window -- both actually score below it on accuracy.
+With only 212 training rows (and news present on just ~20% of them even inside
+the "good" year), this is an honest negative baseline result rather than a bug:
+same-day sentiment alone, on this little data, doesn't show a predictive edge
+over "always guess up." That's a legitimate Phase 2 finding to carry into Phase 3
+(more data/years, richer features, or different modeling choices) and Phase 4
+(hypothesis testing/error analysis should address directly why the baseline
+underperforms majority-class here).
+
+## Phase 3: Model Refinement & Multimodal Integration
+
+Phase 3 addresses the three concrete gaps behind the Phase 2 negative result: too
+little data (news features existed for one year only), a single modality (same-day
+text sentiment, nothing else), and a noisy single-split evaluation.
+
+### Data extension: news features across the full 5-year range
+
+`selection/build_queue.py`, `preprocessing/clean_text.py`,
+`preprocessing/align_dates.py`, `sentiment/run_indobert.py`, `sentiment/build_daily.py`,
+and `analysis/merge_dataset.py` were re-run against all six already-downloaded
+`data/raw/gdelt_id_<year>.parquet` files (2021-2026, 492,777 raw GDELT rows) instead
+of just 2024. This is a pipeline-scope fix, not a new data source -- the raw pulls
+already covered the full range; only the filtering/scraping/scoring steps had been
+run for one pilot year (see Phase 2's "Known limitation").
+
+- Filtered headlines: 55,272 (2024 only) -> **245,162** (2021-09 to 2026-09).
+- `sentiment/run_indobert.py` now caches previously-scored rows by URL (`--no-cache`
+  to force a full re-score) and scores on `mps` where available, since re-scoring
+  the full set on every rerun would otherwise dominate iteration time.
+- Article **bodies stay 2024-only** (10,633 scraped articles) -- scraping all 5 years
+  of the larger 39,837-URL queue is a multi-day job and out of scope here. Body
+  features (`id_body_sent_mean`, `id_body_count`) are therefore sparse outside 2024;
+  they're kept as optional features (filled 0 when absent) rather than blocking the
+  rest of the range.
+- The Kontan GDELT-coverage gap before 2023-03 (see Phase 1's "Resolved risk") is a
+  real structural break in source mix, not new noise -- `features/text_features.py`'s
+  `id_kontan_count_share` / `id_bisnis_count_share` features isolate it from a genuine
+  change in sentiment or volume.
+
+### Modality 2: market data (`fx/fetch_market.py`)
+
+News-only models have no numeric time-series signal to compare against, so Phase 3
+adds one: daily closes for the US Dollar Index (DXY), Brent crude, gold, VIX, US10Y,
+IHSG (Jakarta Composite), and three regional-peer FX pairs (USD/MYR, USD/THB,
+USD/INR), via the same `yfinance` source as `fx/fetch_usdidr.py`. Output:
+`data/processed/market_daily.csv`, joined into `merged_dataset.csv`.
+
+**Leakage handling**: DXY/oil/gold/VIX/US10Y trade on US/London exchanges that close
+hours after Jakarta's WIB trading day ends, so their same-day close is not actually
+observable yet at WIB close-of-day. Every such ticker (`lag_utc_close: true` in
+`config.yaml` -> `market.tickers`) is shifted forward one calendar day before being
+stored, so the value under date `t` is what was genuinely knowable by the end of WIB
+day `t`. IHSG and the regional FX pairs trade during the Asian day and are left
+unshifted. The model also gets yesterday's own USD/IDR return and direction
+(`usd_idr_pct_change_lag1`, `usd_idr_direction_lag1`) as an autocorrelation baseline
+signal, and a "persistence" baseline (predict tomorrow = today's direction) alongside
+the majority-class one.
+
+### Modality 1 extended: richer text features
+
+`features/text_features.py` adds three feature families on top of Phase 2's same-day
+sentiment mean/count:
+- **Temporal dynamics** -- rolling 3/7/14-day sentiment and GDELT-tone means, a
+  "sentiment surprise" (today vs. trailing 30-day mean), and an article-volume
+  z-score, so a news shock still registers on days with zero articles.
+- **Theme-group counts** -- daily counts per `config.yaml` -> `theme_groups`
+  (econ, epu, trade, conflict, sanctions, crisis, politics), parsed from each
+  article's raw GDELT `V2Themes` string -- the most direct geopolitical-shock signal,
+  separate from general tone.
+- **Source-mix share** -- `id_bisnis_count_share` / `id_kontan_count_share`, isolating
+  the Kontan-coverage structural break noted above.
+
+`features/embed_titles.py` adds a semantic-embedding feature: headlines encoded with
+`sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` (384-dim), mean-pooled
+per WIB day. The raw daily vectors are cached as-is and **not** PCA-reduced in this
+script -- fitting a PCA on the full dataset before any train/test split would leak
+future structure into the training fold, so the reduction (to 16 dims) is fit inside
+`modeling/train_refined.py`'s cross-validation loop, on the training fold only, every
+fold.
+
+### Model refinement (`modeling/train_refined.py`)
+
+- **Target**: same as Phase 2 (next-trading-day USD/IDR direction), so results are
+  comparable, now over the full range instead of the 2024 window.
+- **Evaluation**: walk-forward `TimeSeriesSplit` (5 folds, 2-day gap between train and
+  validation to keep rolling-window features from leaking across the fold boundary),
+  plus an untouched final holdout (last 15% of dates). Metrics: accuracy, macro-F1,
+  MCC, ROC-AUC.
+- **Models**: regularized logistic regression (scaled features) and LightGBM, run
+  over both.
+- **Ablation grid** -- the key Phase 3 output, answering "does news add anything
+  beyond market data": `market_only`, `text_sentiment_only`, `text_full`,
+  `text_full_emb`, `market_text_sentiment`, `market_text_full`, `market_text_full_emb`.
+- Outputs: `data/processed/refined_results.json` (full ablation grid, CV means and
+  holdout metrics per feature-set/model combination) and
+  `data/processed/predictions_refined.parquet` (per-row holdout predictions for every
+  combination plus both baselines, for Phase 4 error analysis).
+
+Run the full Phase 3 pipeline with:
+
+```bash
+python -m selection.build_queue
+python -m preprocessing.clean_text
+python -m preprocessing.align_dates
+python -m sentiment.run_indobert            # caches by URL; only new rows re-scored
+python -m sentiment.build_daily
+python -m fx.fetch_market
+python -m analysis.merge_dataset
+python -m features.text_features
+python -m features.embed_titles             # optional but required for *_emb feature sets
+python -m modeling.train_refined
+```
+
+**Results**: _pending -- `modeling/train_refined.py` is running against the
+newly-extended 5-year dataset; the ablation table and holdout metrics will be filled
+in here once that run completes._
+
+## Phase 4: Hypothesis Testing, Error Analysis & Final Report
+
+Phase 4 turns Phase 3's ablation grid and holdout predictions into a formal answer to
+the project's hypothesis ("global geopolitical news significantly influences and
+helps predict USD/IDR"), plus an honest look at where the models succeed or fail.
+The write-up itself is delivered as a separate document (Google Docs); this repo's
+side is the analysis code and the numbers/figures that document draws on.
+
+`analysis/hypothesis_testing.py`
+```
+Inputs: data/processed/predictions_refined.parquet, refined_results.json,
+        merged_dataset.csv, model_features.parquet
+Output: data/processed/hypothesis_test_results.json
+```
+- **McNemar's test** (paired, same holdout days) on `market_only` vs
+  `market_text_full`, `text_sentiment_only` vs `text_full_emb`, and
+  `majority_baseline` vs `market_text_full` -- tests whether adding news changes
+  which specific days the model gets right/wrong by more than chance would predict.
+- **Bootstrap CI** (2,000 resamples) on the accuracy/F1 gap for each pair -- an effect
+  size with uncertainty, complementing McNemar's binary significant/not-significant.
+- **Logistic-regression coefficient significance** on the news features
+  (`statsmodels`, so real p-values), fit on the full pre-holdout window -- tests
+  whether news features carry a statistically distinguishable relationship with
+  next-day direction on their own, independent of any single classifier's holdout
+  score.
+
+Run with: `python -m analysis.hypothesis_testing`
+
+`analysis/error_analysis.py`
+```
+Inputs: data/processed/predictions_refined.parquet, merged_dataset.csv,
+        model_features.parquet
+Outputs: data/processed/error_analysis.json
+         data/processed/figures/{confusion_matrix_market_text,feature_importance,
+                                  error_rate_vs_news_volume}.png
+```
+- **Contingency breakdown** -- of holdout days, how many does `market_text_full` get
+  right that `market_only` gets wrong (and vice versa) -- the concrete version of
+  what McNemar's test above scores statistically.
+- **Misclassification profile** -- compares news volume, sentiment surprise, and
+  theme-group counts on days the best model gets wrong vs. right, and whether errors
+  cluster on unusually large moves.
+- **Feature importance** -- LightGBM gain-based importance for `market_text_full`,
+  refit once on the full pre-holdout window (not a new evaluation).
+- **Case studies** -- the 5 largest single-day USD/IDR moves in the holdout, with
+  what was predicted and what the news looked like that day.
+
+Run with: `python -m analysis.error_analysis`
+
+**Results and report text**: _pending -- both scripts depend on Phase 3's
+`refined_results.json` / `predictions_refined.parquet`, which are still being
+produced. Once they exist, this section will carry the hypothesis-test verdict, the
+error-analysis findings, and the final report text will be drafted for copy-paste
+into the Google Doc._
+
+**Known limitations carried into the final report** (see earlier phases for detail):
+the global/FinBERT half of the hypothesis was never pulled (BigQuery billing never
+enabled), article bodies were only scraped for 2024 (headline-level sentiment covers
+the full 2021-2026 range), Kontan has no GDELT translingual coverage before 2023-03,
+and CNBC Indonesia has no GDELT coverage at all.

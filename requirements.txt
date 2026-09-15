@@ -13,3 +13,7 @@ pyarrow
 matplotlib
 jupyter
 yfinance
+scikit-learn
+lightgbm
+sentence-transformers
+statsmodels

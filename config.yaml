@@ -97,3 +97,35 @@ paths:
 fx:
   ticker: "USDIDR=X"
   source: "yfinance"
+
+# Phase 3: named groups within relevant_theme_prefixes, used by
+# features/text_features.py to build one daily count column per group (e.g.
+# id_theme_armedconflict_count) -- the most direct "geopolitical shock" signal,
+# distinct from the general sentiment score.
+theme_groups:
+  econ: ["ECON_"]
+  epu: ["EPU_"]
+  trade: ["TRADE", "ECON_TRADE"]
+  conflict: ["ARMEDCONFLICT", "MILITARY"]
+  sanctions: ["SANCTIONS"]
+  crisis: ["CRISISLEX"]
+  politics: ["TAX_FNCACT"]
+
+# Phase 3: market-data modality (fx/fetch_market.py). Tickers pulled from Yahoo
+# Finance alongside USD/IDR itself -- USD strength/risk-sentiment/commodity proxies
+# plus regional-peer FX, so the models have a numeric time-series signal to compare
+# news features against. `lag_utc_close` marks tickers whose exchange closes after
+# Jakarta's trading day ends, so their same-day close isn't actually known yet at
+# WIB close-of-day -- fx/fetch_market.py shifts those series forward one day before
+# they're used to predict day t+1 (see README "Phase 3" for the leakage rationale).
+market:
+  tickers:
+    dxy: {symbol: "DX-Y.NYB", lag_utc_close: true}    # US Dollar Index
+    brent: {symbol: "BZ=F", lag_utc_close: true}       # Brent crude
+    gold: {symbol: "GC=F", lag_utc_close: true}
+    vix: {symbol: "^VIX", lag_utc_close: true}
+    us10y: {symbol: "^TNX", lag_utc_close: true}
+    ihsg: {symbol: "^JKSE", lag_utc_close: false}      # Jakarta Composite, closes in WIB
+    usdmyr: {symbol: "USDMYR=X", lag_utc_close: false}
+    usdthb: {symbol: "USDTHB=X", lag_utc_close: false}
+    usdinr: {symbol: "USDINR=X", lag_utc_close: false}
