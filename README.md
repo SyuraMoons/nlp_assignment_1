@@ -204,8 +204,35 @@ politeness settings -- shared by every script in the pipeline.
   exactly the kind of nuance full-text scraping was meant to capture, justifying the
   scrape effort for the capped subset.
 
+## Person B: USD/IDR exchange rate
+
+`fx/fetch_usdidr.py` pulls the daily USD/IDR exchange rate for Person B's slice of
+Task 1, producing the other half of the dataset Person C merges with
+`daily_news_features.csv`.
+
+```
+fx/fetch_usdidr.py
+    -> data/raw/usd_idr_raw.parquet    (raw daily bars, trading days only)
+    -> data/processed/usd_idr_daily.csv  (date, usd_idr_close, usd_idr_pct_change,
+                                           is_trading_day)
+```
+
+Run with: `python -m fx.fetch_usdidr`
+
+**Why Yahoo Finance (`USDIDR=X`) over Bank Indonesia's official JISDOR rate** -- BI's
+rate has no clean historical bulk API (page-scraping only), while `yfinance` gives a
+free, no-auth daily series covering the full project date range in one call --
+important after the BigQuery billing wall hit on the news side. Good enough for a
+course-level hypothesis test; not necessarily the rate a trading desk would use.
+
+**Why forward-fill weekends/holidays instead of leaving gaps** -- forex trades ~24/5,
+so there's no traded close on the ~530 weekend/holiday days in the range. Every
+calendar day in the range still gets a row (`is_trading_day=False` on filled days) so
+the merge with the news table on `date` never drops a date, matching how
+`daily_news_features.csv` already includes every day, news or not.
+
 ## Handoff to Person C
 
-`data/processed/daily_news_features.csv` is the Task 1 deliverable: one row per
-**WIB calendar day**, every day in the range present (zero counts / null scores on
-days without news), ready to merge with the daily USD/IDR series on `date`.
+`data/processed/daily_news_features.csv` (Person A) and `data/processed/usd_idr_daily.csv`
+(Person B) are the two Task 1 deliverables: one row per calendar day each, every day
+in the range present in both, ready to `merge(..., on="date")` for the hypothesis test.

@@ -12,3 +12,4 @@ db-dtypes
 pyarrow
 matplotlib
 jupyter
+yfinance
