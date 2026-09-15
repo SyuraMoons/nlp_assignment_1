@@ -10,6 +10,12 @@ Input: data/processed/id_articles.parquet (from preprocessing/align_dates.py)
 Output: data/processed/id_articles_scored.parquet, same rows plus
   title_sentiment, title_label, body_sentiment (nullable), body_label (nullable)
 
+Rows already scored in an existing id_articles_scored.parquet are reused by URL
+instead of re-run through the model (Phase 3 extends the headline set from ~55k
+2024-only rows to ~245k rows across 2021-2026, and re-scoring everything already
+scored on every rerun would waste most of the runtime). Pass --no-cache to force a
+full re-score (e.g. after changing the model or the label mapping).
+
 Run with:
   python -m sentiment.run_indobert --check-labels   # sanity-check the label mapping first
   python -m sentiment.run_indobert
@@ -19,6 +25,7 @@ import sys
 from pathlib import Path
 
 import pandas as pd
+import torch
 from tqdm import tqdm
 from transformers import pipeline
 
@@ -27,6 +34,15 @@ from common.config import load_config
 
 MODEL_NAME = "mdhugol/indonesia-bert-sentiment-classification"
 MAX_CHARS = 2000  # transformer truncation still applies at the tokenizer level (512 tokens)
+SCORE_COLUMNS = ["title_sentiment", "title_label", "body_sentiment", "body_label"]
+
+
+def pick_device():
+    if torch.backends.mps.is_available():
+        return "mps"
+    if torch.cuda.is_available():
+        return "cuda"
+    return "cpu"
 
 SANITY_POSITIVE = [
     "Ekonomi Indonesia Tumbuh Pesat, Investor Optimistis",
@@ -45,10 +61,14 @@ SANITY_NEGATIVE = [
 
 
 def build_classifier():
-    return pipeline("text-classification", model=MODEL_NAME, top_k=None, truncation=True)
+    device = pick_device()
+    print(f"[run_indobert] using device={device}")
+    return pipeline(
+        "text-classification", model=MODEL_NAME, top_k=None, truncation=True, device=device,
+    )
 
 
-def score_texts(classifier, texts, batch_size=16):
+def score_texts(classifier, texts, batch_size=64):
     """Returns (signed_scores, hard_labels) using P(positive) - P(negative)."""
     signed_scores, hard_labels = [], []
     for i in tqdm(range(0, len(texts), batch_size), desc="scoring"):
@@ -99,10 +119,22 @@ def check_label_mapping():
     return LABEL_POSITIVE, LABEL_NEGATIVE
 
 
+def load_cache(out_path):
+    """Previously scored rows, keyed by url, reused instead of re-running the model."""
+    if not out_path.exists():
+        return None
+    cached = pd.read_parquet(out_path)
+    if not {"url", *SCORE_COLUMNS}.issubset(cached.columns):
+        return None
+    return cached[["url", *SCORE_COLUMNS]].drop_duplicates(subset="url", keep="last")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--check-labels", action="store_true",
                          help="only run the sanity check and print the inferred label mapping")
+    parser.add_argument("--no-cache", action="store_true",
+                         help="re-score every row instead of reusing an existing scored file")
     args = parser.parse_args()
 
     global LABEL_POSITIVE, LABEL_NEGATIVE
@@ -120,21 +152,34 @@ def main():
     if df.empty:
         raise SystemExit("id_articles.parquet is empty -- nothing to score.")
 
+    out_path = processed_dir / "id_articles_scored.parquet"
+    cache = None if args.no_cache else load_cache(out_path)
+
+    if cache is not None:
+        df = df.merge(cache, on="url", how="left")
+        to_score = df["title_sentiment"].isna()
+        print(f"[run_indobert] reusing {(~to_score).sum()} cached rows, "
+              f"scoring {to_score.sum()} new rows")
+    else:
+        to_score = pd.Series(True, index=df.index)
+        for col in SCORE_COLUMNS:
+            df[col] = pd.NA
+
     classifier = build_classifier()
 
-    title_scores, title_labels = score_texts(classifier, df["title"].tolist())
-    df["title_sentiment"] = title_scores
-    df["title_label"] = title_labels
+    if to_score.any():
+        title_scores, title_labels = score_texts(classifier, df.loc[to_score, "title"].tolist())
+        df.loc[to_score, "title_sentiment"] = title_scores
+        df.loc[to_score, "title_label"] = title_labels
 
-    has_body = df["body"].notna()
-    df["body_sentiment"] = pd.NA
-    df["body_label"] = pd.NA
-    if has_body.any():
-        body_scores, body_labels = score_texts(classifier, df.loc[has_body, "body"].tolist())
-        df.loc[has_body, "body_sentiment"] = body_scores
-        df.loc[has_body, "body_label"] = body_labels
+        needs_body = to_score & df["body"].notna()
+        if needs_body.any():
+            body_scores, body_labels = score_texts(classifier, df.loc[needs_body, "body"].tolist())
+            df.loc[needs_body, "body_sentiment"] = body_scores
+            df.loc[needs_body, "body_label"] = body_labels
 
-    out_path = processed_dir / "id_articles_scored.parquet"
+    has_body = df["body_sentiment"].notna()
+    df["title_sentiment"] = df["title_sentiment"].astype(float)
     df.to_parquet(out_path, index=False)
     print(f"[run_indobert] wrote {len(df)} scored rows to {out_path}")
     if has_body.any():
