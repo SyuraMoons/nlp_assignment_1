@@ -91,3 +91,9 @@ paths:
   raw_dir: "data/raw"
   interim_dir: "data/interim"
   processed_dir: "data/processed"
+
+# Person B's Task 1 scope: daily USD/IDR exchange rate, merged with the news
+# features table on `date` for the hypothesis test.
+fx:
+  ticker: "USDIDR=X"
+  source: "yfinance"
