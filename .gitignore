@@ -4,10 +4,5 @@ __pycache__/
 venv/
 .env
 
-# scraped/processed data is large and reproducible from scripts + config.yaml
-data/raw/
-data/interim/
-data/processed/
-
 .ipynb_checkpoints/
 .DS_Store
