@@ -1,4 +1,5 @@
-# Shared config for GDELT acquisition, filtering, scraping, and sentiment scoring.
+# Shared config for the Task 1 pipeline: GDELT acquisition, filtering, scraping,
+# cleaning, Bank Indonesia JISDOR exchange rate, and news -> trading-day alignment.
 
 # GCP project used to run BigQuery queries against GDELT's public dataset (billing/
 # quota attribution -- the dataset itself is free to query). Must have the BigQuery
@@ -7,7 +8,7 @@ gcp_project: "nlpassignment-508617"
 
 date_range:
   start: "2021-09-01"
-  end: "2026-09-14"
+  end: "2026-09-01"   # Task 1 spec: 1 Sep 2021 - 1 Sep 2026
 
 timezone: "Asia/Jakarta"  # IDR trades in Jakarta; all "daily" aggregation uses WIB calendar days
 
@@ -88,44 +89,25 @@ scraping:
   user_agent: "Mozilla/5.0 (compatible; NLPCourseProjectBot/1.0; contact: harfiibadurrahman@gmail.com)"
 
 paths:
-  raw_dir: "data/raw"
-  interim_dir: "data/interim"
+  raw_dir: "data/raw"            # full raw pulls (gitignored; reproducible from src/)
+  interim_dir: "data/interim"    # intermediate tables (gitignored)
   processed_dir: "data/processed"
+  sample_dir: "data/raw_sample"  # small committed samples of every raw source
 
-# Person B's Task 1 scope: daily USD/IDR exchange rate, merged with the news
-# features table on `date` for the hypothesis test.
+# USD/IDR exchange rate: Bank Indonesia's JISDOR reference rate (Task 1 requires
+# Bank Indonesia as the source). Downloaded manually as Excel from
+# https://www.bi.go.id/id/statistik/informasi-kurs/jisdor/default.aspx
+# (BI's site blocks scripted access), saved to data/raw/jisdor/.
 fx:
-  ticker: "USDIDR=X"
-  source: "yfinance"
+  source: "Bank Indonesia JISDOR"
+  raw_file: "data/raw/jisdor/jisdor_raw.xlsx"
 
-# Phase 3: named groups within relevant_theme_prefixes, used by
-# features/text_features.py to build one daily count column per group (e.g.
-# id_theme_armedconflict_count) -- the most direct "geopolitical shock" signal,
-# distinct from the general sentiment score.
-theme_groups:
-  econ: ["ECON_"]
-  epu: ["EPU_"]
-  trade: ["TRADE", "ECON_TRADE"]
-  conflict: ["ARMEDCONFLICT", "MILITARY"]
-  sanctions: ["SANCTIONS"]
-  crisis: ["CRISISLEX"]
-  politics: ["TAX_FNCACT"]
+# News -> trading-day alignment rule (src/alignment/align_news.py).
+# JISDOR is fixed once per Indonesian business day and published at 10:00 WIB.
+# A news item is assigned to the FIRST JISDOR fixing that happens at or after it:
+#   - published on a trading day at/before the cutoff  -> that same trading day
+#   - published after the cutoff                      -> next trading day
+#   - published on a weekend / public holiday          -> next trading day
+alignment:
+  cutoff_time_wib: "10:00"
 
-# Phase 3: market-data modality (fx/fetch_market.py). Tickers pulled from Yahoo
-# Finance alongside USD/IDR itself -- USD strength/risk-sentiment/commodity proxies
-# plus regional-peer FX, so the models have a numeric time-series signal to compare
-# news features against. `lag_utc_close` marks tickers whose exchange closes after
-# Jakarta's trading day ends, so their same-day close isn't actually known yet at
-# WIB close-of-day -- fx/fetch_market.py shifts those series forward one day before
-# they're used to predict day t+1 (see README "Phase 3" for the leakage rationale).
-market:
-  tickers:
-    dxy: {symbol: "DX-Y.NYB", lag_utc_close: true}    # US Dollar Index
-    brent: {symbol: "BZ=F", lag_utc_close: true}       # Brent crude
-    gold: {symbol: "GC=F", lag_utc_close: true}
-    vix: {symbol: "^VIX", lag_utc_close: true}
-    us10y: {symbol: "^TNX", lag_utc_close: true}
-    ihsg: {symbol: "^JKSE", lag_utc_close: false}      # Jakarta Composite, closes in WIB
-    usdmyr: {symbol: "USDMYR=X", lag_utc_close: false}
-    usdthb: {symbol: "USDTHB=X", lag_utc_close: false}
-    usdinr: {symbol: "USDINR=X", lag_utc_close: false}

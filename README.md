@@ -1,562 +1,186 @@
 # Global Geopolitical Event Prediction: Impact on USD/IDR
 
-NLP course project testing whether global geopolitical news predicts USD/IDR exchange
-rate movements. This repo covers **Task 1: news data acquisition & preprocessing**
-(Person A's scope) -- pulling Indonesian financial/geopolitical news and global
-geopolitical headlines, scraping full article text for a filtered subset, cleaning
-everything, and scoring daily sentiment, ready to merge with Person B's USD/IDR series
-(Person C's job).
+**Task 1: Data Acquisition & Strategic Preprocessing.** This is the NLP course project testing the hypothesis:
+*global geopolitical news significantly influences and helps predict fluctuations in the USD exchange rate.*
 
-## Scope (current)
+This repo builds a clean, aligned 5-year dataset (1 Sep 2021 to 1 Sep 2026) from two streams:
 
-- **Indonesian sources**: Kontan.co.id (GDELT coverage from 2023-03 only) and
-  Bisnis.com (full range). CNBC Indonesia was in the original target list but has
-  zero GDELT translingual coverage and was dropped -- see "Resolved risk" below.
-- **Global sources**: a whitelist of major English outlets (Reuters, AP, BBC, Al
-  Jazeera, CNBC, The Guardian, NYT, FT, WSJ, Bloomberg), filtered to geopolitical
-  GDELT themes. **Not yet pulled** -- blocked on BigQuery billing, see "Known
-  limitation" below; current deliverable is Indonesian-side only.
-- **Date range**: ~5 years, Sept 2021 - Sept 2026 (see `config.yaml`)
-- **Sentiment**: IndoBERT (`mdhugol/indonesia-bert-sentiment-classification`) on
-  Indonesian titles and scraped bodies; FinBERT (`ProsusAI/finbert`) on global titles
-  (pending global data)
+| Stream | Source | Final size |
+|---|---|---|
+| Geopolitical / macro news | GDELT GKG (discovery + metadata), with full text scraped from Bisnis.com and Kontan.co.id | 243,844 articles |
+| USD/IDR exchange rate | **Bank Indonesia JISDOR** reference rate | 1,202 trading days |
 
-## Why GDELT + targeted scraping, not scrape-everything
+---
 
-An earlier version of this pipeline discovered article URLs by querying the Internet
-Archive's Wayback Machine CDX API (native sitemaps on these sites only cover the last
-~2 days, and site search/full sitemaps are Cloudflare-protected). That approach broke
-down for real use: domain-wide CDX queries return 504 timeouts, fetching every
-archived article across 5 years would be roughly 1M requests (multiple weeks even at
-polite delays), and Kontan's URLs carry no date, so articles filed under the wrong
-month.
+## Repository layout
 
-Instead, **GDELT's translingual GKG feed (pulled via BigQuery) is the discovery index
-and the primary dataset**: it already has each article's URL, original-language
-headline, timestamp, GDELT topic themes, and tone score, across the whole 5-year
-window, without fetching a single article page. Headline sentiment is a real,
-complete deliverable on its own if scraping produces nothing else.
+```
+├── config.yaml                  # every tunable choice: dates, sources, sections, themes, cutoff
+├── requirements.txt
+├── src/
+│   ├── common/                  # config loader, GDELT helpers (URL normalisation, UTC -> WIB)
+│   ├── gdelt/                   # 1. BigQuery pull of GDELT GKG rows (+ SQL queries)
+│   ├── selection/               # 2. section + theme filter, capped scrape queue
+│   ├── scrapers/                # 3. per-site full-text scrapers (polite, resumable)
+│   ├── preprocessing/           # 4. text cleaning + deduplication
+│   ├── fx/                      # 5. Bank Indonesia JISDOR loader
+│   ├── alignment/               # 6. news -> trading-day alignment, 7. final dataset
+│   └── make_raw_samples.py      # writes data/raw_sample/
+├── data/
+│   ├── raw_sample/              # small samples of every raw source (GDELT rows, scraped articles, JISDOR xlsx)
+│   └── processed/               # final cleaned + aligned dataset (see "Output data" below)
+└── notebooks/
+    └── 01_task1_eda.ipynb       # evidence for the filtering/alignment choices
+```
 
-Full article text is still valuable (this is a "strategic preprocessing" task, and a
-10-word headline gives little to preprocess or analyze), so a filtered subset of that
-GDELT index -- sections relevant to macro/markets/international news, GDELT themes
-relevant to geopolitics/economy, capped per site per day -- gets scraped for its full
-body, reusing per-site parsers that were built and tested against each site's real
-HTML. This keeps the scrape to roughly 50-80k articles instead of ~1M.
-
-**Resolved risk (coverage.sql run 2026-09-15):** GDELT's `gkg_partitioned` table does
-carry translingual rows for two of the three configured Indonesian sites, but **not
-all**:
-- `bisnis.com` -- full coverage, every month from 2021-09 through 2026-09.
-- `kontan.co.id` -- coverage only starts **2023-03**; nothing before that. The 2021-09
-  to 2023-02 window for Kontan is a real gap in GDELT's index, not a scraping or
-  query bug.
-- `cnbcindonesia.com` -- **zero rows across the entire 5-year window.** GDELT's
-  translingual GKG feed does not index this domain at all. It was dropped from the
-  scraped/scored dataset as a result; `sites`/`id_domains` in `config.yaml` still list
-  it for traceability, but no pipeline output contains CNBC Indonesia data. This is a
-  documented data-availability constraint, not an oversight.
-
-**Known limitation, not yet resolved:** the global (English-outlet) GDELT pull has not
-been run -- the project's GCP project has no billing account attached, and BigQuery's
-free-tier sandbox quota (1 TiB/month) was exhausted by the Indonesian pulls alone. As a
-result, `data/processed/global_headlines_scored.parquet` and every downstream "global"
-column in `daily_news_features.csv` are currently empty (0 rows). The daily feature
-table is still a valid, complete deliverable for the **Indonesian domestic-reaction**
-half of the hypothesis; the global/FinBERT half is pending billing being enabled on
-the BigQuery project.
+The full raw pulls (`data/raw/`, ~280 MB) and intermediate tables (`data/interim/`) are not committed. Every script regenerates them.
 
 ## Pipeline
 
-```
-gdelt/fetch.py --query coverage           # sanity check: do these domains have GKG rows?
-gdelt/fetch.py --query id --year YYYY     # -> data/raw/gdelt_id_<year>.parquet
-gdelt/fetch.py --query global --year YYYY # -> data/raw/gdelt_global_<year>.parquet
-
-selection/build_queue.py
-    -> data/processed/id_headlines_filtered.parquet   (section + theme filtered, deduped)
-    -> data/interim/scrape_queue.parquet              (above, capped per site/day)
-    -> data/processed/filter_report.json              (drop counts per stage)
-
-scrapers/kontan.py, bisnis.py, cnbc_indonesia.py  (or scrapers/run_all.py for all three)
-    -> data/raw/articles/<site>.jsonl                 (full text for queued URLs only)
-
-preprocessing/clean_text.py
-    -> data/interim/id_headlines_clean.parquet
-    -> data/interim/global_headlines_clean.parquet
-    -> data/interim/bodies_clean.parquet
-
-preprocessing/align_dates.py
-    -> data/processed/id_articles.parquet       (headlines + bodies merged, WIB dates)
-    -> data/processed/global_headlines.parquet
-
-sentiment/run_indobert.py --check-labels  # confirm the label mapping first
-sentiment/run_indobert.py
-    -> data/processed/id_articles_scored.parquet
-sentiment/run_finbert.py
-    -> data/processed/global_headlines_scored.parquet
-
-sentiment/build_daily.py
-    -> data/processed/daily_news_features.csv   # one row per calendar day, gap days included
+```mermaid
+flowchart TD
+    A["GDELT GKG on BigQuery<br/>Kontan, Bisnis, CNBC Indonesia domains<br/>Sep 2021 to Sep 2026"] -->|"src.gdelt.fetch<br/>492,777 rows"| B["Raw headlines + URL, timestamp,<br/>themes, tone"]
+    B -->|"src.selection.build_queue<br/>URL dedupe, section filter, theme filter"| C["245,162 relevant headlines"]
+    C -->|"cap 15 per site per day"| D["Scrape queue<br/>39,837 URLs"]
+    D -->|"src.scrapers<br/>polite, resumable"| E["Full article bodies"]
+    C --> F
+    E --> F["src.preprocessing.clean_text<br/>HTML unescape, boilerplate strip,<br/>length filter, cross-site title dedupe"]
+    F -->|"244,823 headlines<br/>10,594 bodies"| H
+    G["Bank Indonesia JISDOR<br/>Excel export"] -->|"src.fx.load_jisdor"| G2["1,202 fixing days<br/>= trading calendar"]
+    G2 --> H["src.alignment.align_news<br/>each article goes to the FIRST<br/>10:00 WIB fixing at or after it"]
+    H --> I["articles_aligned/<br/>243,844 articles + trading_date"]
+    I --> J["src.alignment.build_dataset"]
+    G2 --> J
+    J --> K["final_dataset.csv<br/>1 row per trading day:<br/>rate, return, direction, news counts,<br/>GDELT tone, headlines"]
 ```
 
-`data/raw`, `data/interim`, and `data/processed` are gitignored (large, reproducible
-from the scripts).
+### How to run
 
-## Setup
+Run everything from the repository root:
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
+python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-gcloud auth application-default login   # BigQuery auth; you run this yourself
+gcloud auth application-default login          # BigQuery auth (only for step 1)
+
+python -m src.gdelt.fetch --query coverage      # sanity check: which domains GDELT indexes
+python -m src.gdelt.fetch --query id --year 2021  # repeat for 2021..2026
+python -m src.selection.build_queue
+python -m src.scrapers.run_all                  # resumable; skips already-saved URLs
+python -m src.preprocessing.clean_text
+# download JISDOR Excel from bi.go.id -> data/raw/jisdor/jisdor_raw.xlsx (see below)
+python -m src.fx.load_jisdor
+python -m src.alignment.align_news
+python -m src.alignment.build_dataset
+python -m src.make_raw_samples
 ```
 
-## Running the pipeline
-
-```bash
-# 1. Confirm GDELT has what we need before pulling anything real
-python -m gdelt.fetch --query coverage
-python -m gdelt.fetch --query id --year 2024 --dry-run
-
-# 2. Pull one pilot year, build the queue, and spot-check before scaling to all 5 years
-python -m gdelt.fetch --query id --year 2024
-python -m gdelt.fetch --query global --year 2024
-python -m selection.build_queue
-
-# 3. Scrape the queued articles (can run all three sites in parallel)
-python -m scrapers.run_all
-
-# 4. Preprocess
-python -m preprocessing.clean_text
-python -m preprocessing.align_dates
-
-# 5. Score sentiment
-python -m sentiment.run_indobert --check-labels   # confirm label mapping first
-python -m sentiment.run_indobert
-python -m sentiment.run_finbert
-
-# 6. Build the daily feature table
-python -m sentiment.build_daily
-```
-
-Repeat steps 1-2 for every year in the range once the pilot year looks right (or
-adjust `gdelt/fetch.py` to loop over years). Each scraper is resumable: re-running it
-skips URLs already saved in `data/raw/articles/<site>.jsonl`.
-
-## Config
-
-`config.yaml` holds the date range, timezone, GDELT domains/themes, per-site sections
-considered in scope, the relevance theme list, the daily scrape cap, and scraping
-politeness settings -- shared by every script in the pipeline.
-
-## Design decisions
-
-- **Why GDELT as the discovery index, not scrape-everything** -- see "Why GDELT +
-  targeted scraping" above.
-- **Why these three Indonesian sources / this outlet whitelist for global** -- Kontan,
-  Bisnis, and CNBC Indonesia are the three largest Indonesian-language financial/macro
-  news outlets, giving broad domestic coverage of exactly the kind of reporting
-  (rate moves, inflation, trade policy) expected to move USD/IDR. In practice GDELT
-  only indexes two of the three (see "Resolved risk" above) -- CNBC Indonesia was
-  dropped after the coverage check came back empty for it, leaving Kontan + Bisnis as
-  the actual domestic source set. The global whitelist (Reuters, AP, BBC, Al Jazeera,
-  CNBC, The Guardian, NYT, FT, WSJ, Bloomberg) was chosen as major English-language
-  outlets with both broad geopolitical reach and financial-market desks, so the same
-  set plausibly covers both the "shock" (geopolitical event) and "market read-through"
-  (financial-press framing) sides of the global hypothesis half.
-- **Why these sections** (`config.yaml` → `sections`) **and not the full site** -- each
-  site's section filter keeps only channels covering national/international news,
-  finance, and markets/investment (e.g. Kontan's `nasional`, `internasional`,
-  `keuangan`, `investasi`; Bisnis's `ekonomi`, `market`, `kabar24`), and drops sections
-  irrelevant to the hypothesis. On the real filter output this dropped roughly half
-  the raw pull (118,459 → 56,917 rows) -- the largest dropped categories were
-  `momsmoney` (11,014, a separate personal-finance vertical), `finansial` (7,667,
-  overlapping/duplicate financial content), `insight` (7,372, opinion/analysis rather
-  than news), plus regional/lifestyle sections (`bandung`, `sumatra`, `bola`,
-  `lifestyle`, etc.) that are off-topic for a macro/FX hypothesis.
-- **Why this theme-prefix list** (`config.yaml` → `relevant_theme_prefixes`) -- the
-  list (`ECON_`, `EPU_`, `TAX_FNCACT`, `ARMEDCONFLICT`, `SANCTIONS`, `MILITARY`,
-  `TRADE`, `CRISISLEX`) targets GDELT's own topic taxonomy for economic policy,
-  conflict, and trade themes -- the categories most directly tied to currency-moving
-  events. Checked against real output: the theme filter is comparatively light-touch
-  (56,917 → 55,272 rows, ~3% dropped) since the section filter already narrows to
-  finance/macro/international channels where these themes dominate; most of the actual
-  precision comes from section filtering, not theme filtering.
-- **Why a daily cap of 15 per site**, and what tradeoff that represents -- full-text
-  scraping is the slowest, most failure-prone stage (network I/O, per-site parsing,
-  politeness delays), while GDELT headline-level sentiment already covers every
-  filtered row regardless of the cap. Capping at 15/site/day bounds scrape volume to a
-  tractable ~10-11k articles across the full date range (the real queue came out to
-  10,633) instead of the full 55,272 filtered headlines, trading full-body coverage
-  for scrape time/cost while keeping headline-level coverage complete for all of them.
-  Articles are selected deterministically by sorted URL hash so cap choices are
-  reproducible across reruns.
-- **Why WIB (UTC+7) for date alignment** -- IDR trades in Jakarta.
-- **Why a probability-based sentiment score** (P(pos) − P(neg)) instead of a hard
-  label -- preserves model confidence instead of collapsing it to -1/0/1.
-- **Why score both title and body**, and what the title/body sentiment agreement rate
-  says -- of the 10,633 queued articles, 10,560 got both title and body scored; their
-  title/body sentiment **sign agreement is 91.9%**. That's high enough that headline-only
-  sentiment would likely have captured most of the same signal, but the ~8% disagreement
-  (cases where a headline reads one way and the body's overall tone reads the other --
-  e.g. a neutral/negative-sounding headline over an ultimately reassuring article) is
-  exactly the kind of nuance full-text scraping was meant to capture, justifying the
-  scrape effort for the capped subset.
-
-## Person B: USD/IDR exchange rate
-
-`fx/fetch_usdidr.py` pulls the daily USD/IDR exchange rate for Person B's slice of
-Task 1, producing the other half of the dataset Person C merges with
-`daily_news_features.csv`.
-
-```
-fx/fetch_usdidr.py
-    -> data/raw/usd_idr_raw.parquet    (raw daily bars, trading days only)
-    -> data/processed/usd_idr_daily.csv  (date, usd_idr_close, usd_idr_pct_change,
-                                           is_trading_day)
-```
-
-Run with: `python -m fx.fetch_usdidr`
-
-**Why Yahoo Finance (`USDIDR=X`) over Bank Indonesia's official JISDOR rate** -- BI's
-rate has no clean historical bulk API (page-scraping only), while `yfinance` gives a
-free, no-auth daily series covering the full project date range in one call --
-important after the BigQuery billing wall hit on the news side. Good enough for a
-course-level hypothesis test; not necessarily the rate a trading desk would use.
-
-**Why forward-fill weekends/holidays instead of leaving gaps** -- forex trades ~24/5,
-so there's no traded close on the ~530 weekend/holiday days in the range. Every
-calendar day in the range still gets a row (`is_trading_day=False` on filled days) so
-the merge with the news table on `date` never drops a date, matching how
-`daily_news_features.csv` already includes every day, news or not.
-
-## Final Task 1 dataset
-
-`analysis/merge_dataset.py` joins the news-sentiment features and the USD/IDR rate
-into one dataset:
-
-```
-analysis/merge_dataset.py
-    -> data/processed/merged_dataset.csv
-```
-
-Run with: `python -m analysis.merge_dataset`
-
-`data/processed/merged_dataset.csv` is the Task 1 deliverable: one row per calendar
-day (1840 rows, 2021-09-01 to 2026-09-14), combining `daily_news_features.csv`'s
-sentiment/count columns with `usd_idr_daily.csv`'s exchange-rate columns, ready for
-the modeling/hypothesis-testing tasks later in the course.
-
-## Phase 2: Pipeline Proposal & Baseline Experimentation
-
-`modeling/train_baseline.py` is the first modeling pass on top of the Task 1
-dataset -- a naive baseline plus two standard simple/interpretable classifiers
-(Gaussian Naive Bayes, Logistic Regression), evaluated on a proper chronological
-(no-shuffle) split, before any more advanced modeling.
-
-```
-modeling/train_baseline.py
-    -> data/processed/baseline_results.json
-```
-
-Run with: `python -m modeling.train_baseline`
-
-**Task**: binary classification of next-trading-day USD/IDR direction (up vs.
-down), from same-day Indonesian news-sentiment features. Exact-zero "flat"
-trading days (9 of them) are dropped as a rare, ambiguous third class;
-non-trading days are excluded entirely since their `usd_idr_pct_change` is a
-forward-fill artifact, not a real market move.
-
-**Known limitation that scopes this experiment:** inspecting `merged_dataset.csv`
-by month shows the Indonesian news features (`id_title_count`, etc.) are nonzero
-**only for 2024-01 through 2025-01** -- every other month across the full 5-year
-range has zero articles. This lines up with the pipeline's "pull one pilot year
-first" instructions (see "Running the pipeline" above) never having been scaled
-to the other years. Training on the full 5-year range would therefore mostly
-train on "no news that day" rows, so baseline modeling here is restricted to the
-2024-01-01 -- 2025-01-07 window where news coverage is real. Extending training
-to the full range is future work, pending the rest of the years being pulled/
-scraped/scored the same way 2024 was.
-
-**Features**: `id_title_sent_mean`, `id_title_count`, `id_gdelt_tone_mean`,
-`id_body_sent_mean`, `id_body_count`, `id_bisnis_count`, `id_kontan_count`, plus a
-binary `has_news` indicator (news is missing on ~80% of days even within the 2024
-window, so missing sentiment is filled with 0/neutral rather than dropped).
-`global_*` columns are excluded -- they're all-NaN in this window (see "Known
-limitation" under Person B/global scope above).
-
-**Split**: chronological, last 20% of dates in the window held out as test (train
-on earlier dates, test on later ones) to avoid look-ahead leakage.
-
-**Results** (2024-01-01 to 2025-01-07 window, train=212, test=53,
-test set positive rate=0.566):
-
-| model | accuracy | f1_macro |
-|---|---|---|
-| majority_baseline | 0.566 | 0.361 |
-| gaussian_naive_bayes | 0.415 | 0.356 |
-| logistic_regression | 0.396 | 0.378 |
-
-**Reading the result**: neither classifier beats the trivial majority-class
-baseline on this held-out window -- both actually score below it on accuracy.
-With only 212 training rows (and news present on just ~20% of them even inside
-the "good" year), this is an honest negative baseline result rather than a bug:
-same-day sentiment alone, on this little data, doesn't show a predictive edge
-over "always guess up." That's a legitimate Phase 2 finding to carry into Phase 3
-(more data/years, richer features, or different modeling choices) and Phase 4
-(hypothesis testing/error analysis should address directly why the baseline
-underperforms majority-class here).
-
-## Phase 3: Model Refinement & Multimodal Integration
-
-Phase 3 addresses the three concrete gaps behind the Phase 2 negative result: too
-little data (news features existed for one year only), a single modality (same-day
-text sentiment, nothing else), and a noisy single-split evaluation.
-
-### Data extension: news features across the full 5-year range (partially completed)
-
-`selection/build_queue.py`, `preprocessing/clean_text.py`, and
-`preprocessing/align_dates.py` were re-run against all six already-downloaded
-`data/raw/gdelt_id_<year>.parquet` files (2021-2026, 492,777 raw GDELT rows) instead
-of just 2024, taking filtered headlines from 55,272 (2024 only) to **245,162**
-(2021-09 to 2026-09). This is a pipeline-scope fix, not a new data source -- the raw
-pulls already covered the full range; only the filtering/scraping/scoring steps had
-been run for one pilot year (see Phase 2's "Known limitation").
-
-`sentiment/run_indobert.py` was updated to cache previously-scored rows by URL
-(`--no-cache` to force a full re-score) and score on `mps` where available, since
-re-scoring the full set on every rerun would otherwise dominate iteration time.
-**Scoring all 245,162 headlines was started but not completed in this pass** --
-IndoBERT throughput on this machine (~15-30 titles/sec, degrading further under
-sustained load) made the full re-score a 1.5-2+ hour job, which time constraints
-didn't allow. **The results below therefore still use the original 55,134 headlines
-scored for 2024-01 through 2025-01 only** -- the same window as Phase 2 -- with the
-market modality and richer text-dynamics/theme features layered on top of that same
-window. Finishing the full re-score (the code is ready and cache-aware; a rerun of
-`sentiment/run_indobert.py` will only need to score the ~190k new rows, not redo the
-55k already cached) is the single highest-value next step, since it would give the
-holdout evaluation below real news coverage instead of none (see the "Critical
-caveat" note under Results).
-
-Article **bodies stay 2024-only** regardless (10,633 scraped articles) -- scraping
-all 5 years of the larger 39,837-URL queue is a multi-day job and out of scope here.
-Body features (`id_body_sent_mean`, `id_body_count`) are therefore sparse outside
-2024; they're kept as optional features (filled 0 when absent) rather than blocking
-the rest of the range.
-
-The Kontan GDELT-coverage gap before 2023-03 (see Phase 1's "Resolved risk") is a
-real structural break in source mix, not new noise -- `features/text_features.py`'s
-`id_kontan_count_share` / `id_bisnis_count_share` features isolate it from a genuine
-change in sentiment or volume.
-
-### Modality 2: market data (`fx/fetch_market.py`)
-
-News-only models have no numeric time-series signal to compare against, so Phase 3
-adds one: daily closes for the US Dollar Index (DXY), Brent crude, gold, VIX, US10Y,
-IHSG (Jakarta Composite), and three regional-peer FX pairs (USD/MYR, USD/THB,
-USD/INR), via the same `yfinance` source as `fx/fetch_usdidr.py`. Output:
-`data/processed/market_daily.csv`, joined into `merged_dataset.csv`.
-
-**Leakage handling**: DXY/oil/gold/VIX/US10Y trade on US/London exchanges that close
-hours after Jakarta's WIB trading day ends, so their same-day close is not actually
-observable yet at WIB close-of-day. Every such ticker (`lag_utc_close: true` in
-`config.yaml` -> `market.tickers`) is shifted forward one calendar day before being
-stored, so the value under date `t` is what was genuinely knowable by the end of WIB
-day `t`. IHSG and the regional FX pairs trade during the Asian day and are left
-unshifted. The model also gets yesterday's own USD/IDR return and direction
-(`usd_idr_pct_change_lag1`, `usd_idr_direction_lag1`) as an autocorrelation baseline
-signal, and a "persistence" baseline (predict tomorrow = today's direction) alongside
-the majority-class one.
-
-### Modality 1 extended: richer text features
-
-`features/text_features.py` adds three feature families on top of Phase 2's same-day
-sentiment mean/count:
-- **Temporal dynamics** -- rolling 3/7/14-day sentiment and GDELT-tone means, a
-  "sentiment surprise" (today vs. trailing 30-day mean), and an article-volume
-  z-score, so a news shock still registers on days with zero articles.
-- **Theme-group counts** -- daily counts per `config.yaml` -> `theme_groups`
-  (econ, epu, trade, conflict, sanctions, crisis, politics), parsed from each
-  article's raw GDELT `V2Themes` string -- the most direct geopolitical-shock signal,
-  separate from general tone.
-- **Source-mix share** -- `id_bisnis_count_share` / `id_kontan_count_share`, isolating
-  the Kontan-coverage structural break noted above.
-
-`features/embed_titles.py` adds a semantic-embedding feature: headlines encoded with
-`sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` (384-dim), mean-pooled
-per WIB day. The raw daily vectors are cached as-is and **not** PCA-reduced in this
-script -- fitting a PCA on the full dataset before any train/test split would leak
-future structure into the training fold, so the reduction (to 16 dims) is fit inside
-`modeling/train_refined.py`'s cross-validation loop, on the training fold only, every
-fold.
-
-### Model refinement (`modeling/train_refined.py`)
-
-- **Target**: same as Phase 2 (next-trading-day USD/IDR direction), so results are
-  comparable, now over the full range instead of the 2024 window.
-- **Evaluation**: walk-forward `TimeSeriesSplit` (5 folds, 2-day gap between train and
-  validation to keep rolling-window features from leaking across the fold boundary),
-  plus an untouched final holdout (last 15% of dates). Metrics: accuracy, macro-F1,
-  MCC, ROC-AUC.
-- **Models**: regularized logistic regression (scaled features) and LightGBM, run
-  over both.
-- **Ablation grid** -- the key Phase 3 output, answering "does news add anything
-  beyond market data": `market_only`, `text_sentiment_only`, `text_full`,
-  `text_full_emb`, `market_text_sentiment`, `market_text_full`, `market_text_full_emb`.
-- Outputs: `data/processed/refined_results.json` (full ablation grid, CV means and
-  holdout metrics per feature-set/model combination) and
-  `data/processed/predictions_refined.parquet` (per-row holdout predictions for every
-  combination plus both baselines, for Phase 4 error analysis).
-
-Run the full Phase 3 pipeline with:
-
-```bash
-python -m selection.build_queue
-python -m preprocessing.clean_text
-python -m preprocessing.align_dates
-python -m sentiment.run_indobert            # caches by URL; only new rows re-scored
-python -m sentiment.build_daily
-python -m fx.fetch_market
-python -m analysis.merge_dataset
-python -m features.text_features
-python -m features.embed_titles             # optional but required for *_emb feature sets
-python -m modeling.train_refined
-```
-
-**Results** (2021-09-01 to 2026-09-10, n=1,299 labeled trading days; walk-forward CV
-on the first 1,104, untouched holdout on the last 195, 2025-12-03 to 2026-09-10;
-holdout positive rate 0.559):
-
-| feature set | model | CV accuracy | CV MCC | holdout accuracy | holdout F1-macro | holdout MCC |
-|---|---|---|---|---|---|---|
-| majority_baseline | - | - | - | 0.559 | 0.359 | 0.000 |
-| persistence_baseline | - | - | - | 0.400 | 0.400 | -0.187 |
-| market_only | LogReg | 0.548 | 0.086 | 0.590 | 0.576 | 0.157 |
-| market_only | LightGBM | 0.529 | 0.049 | 0.574 | 0.547 | 0.114 |
-| text_sentiment_only | LogReg | 0.534 | 0.014 | 0.559 | 0.359 | 0.000 |
-| text_full | LogReg | 0.537 | 0.020 | 0.559 | 0.359 | 0.000 |
-| market_text_sentiment | LogReg | 0.553 | 0.098 | 0.605 | 0.591 | 0.188 |
-| **market_text_full** | **LogReg** | **0.555** | **0.102** | 0.590 | 0.576 | 0.157 |
-| **market_text_full** | **LightGBM** | 0.530 | 0.052 | **0.621** | **0.595** | **0.213** |
-
-(`text_full_emb` / `market_text_full_emb` rows are identical to `text_full` /
-`market_text_full` here -- `features/embed_titles.py` didn't finish downloading its
-model in time, so no embedding columns exist yet; see "Data extension" above.)
-
-**Critical caveat -- read before trusting the holdout numbers**: the holdout window
-(2025-12-03 to 2026-09-10) falls entirely **outside** the only period with real news
-coverage (2024-01 to 2025-01, per the "Data extension" note above). Every text
-feature is exactly 0/flat for every holdout row. That means `market_text_full`'s
-higher holdout accuracy (0.621 vs. `market_only`'s 0.574, both LightGBM) **cannot be
-attributed to news content** -- there is no news signal present in the holdout to
-attribute it to. It reflects noise/variance between two models fit on slightly
-different feature sets, not evidence for the hypothesis.
-
-**The CV numbers are the more meaningful comparison** for now, since the walk-forward
-folds are drawn from the first 1,104 rows (up to 2025-12-02), which do include the
-real 2024 news window. There, `market_text_full` (LogReg) reaches CV accuracy 0.555
-and MCC 0.102 vs. `market_only`'s 0.548 accuracy / 0.086 MCC -- a small improvement,
-consistent with Phase 4's hypothesis test below (not statistically significant, but
-directionally positive). `text_sentiment_only` alone (CV accuracy 0.534, MCC 0.014)
-is barely better than chance and far behind `market_only` -- news alone remains a
-weak signal, matching Phase 2's original negative finding; it only helps when
-combined with market data.
-
-**Bottom line**: finishing the 5-year IndoBERT re-score (data extension above) is
-the single change most likely to produce a real answer here, since it would give the
-holdout period actual news coverage to test against instead of none.
-
-## Phase 4: Hypothesis Testing, Error Analysis & Final Report
-
-Phase 4 turns Phase 3's ablation grid and holdout predictions into a formal answer to
-the project's hypothesis ("global geopolitical news significantly influences and
-helps predict USD/IDR"), plus an honest look at where the models succeed or fail.
-The write-up itself is delivered as a separate document (Google Docs); this repo's
-side is the analysis code and the numbers/figures that document draws on.
-
-`analysis/hypothesis_testing.py`
-```
-Inputs: data/processed/predictions_refined.parquet, refined_results.json,
-        merged_dataset.csv, model_features.parquet
-Output: data/processed/hypothesis_test_results.json
-```
-- **McNemar's test** (paired, same holdout days) on `market_only` vs
-  `market_text_full`, `text_sentiment_only` vs `text_full_emb`, and
-  `majority_baseline` vs `market_text_full` -- tests whether adding news changes
-  which specific days the model gets right/wrong by more than chance would predict.
-- **Bootstrap CI** (2,000 resamples) on the accuracy/F1 gap for each pair -- an effect
-  size with uncertainty, complementing McNemar's binary significant/not-significant.
-- **Logistic-regression coefficient significance** on the news features
-  (`statsmodels`, so real p-values), fit on the full pre-holdout window -- tests
-  whether news features carry a statistically distinguishable relationship with
-  next-day direction on their own, independent of any single classifier's holdout
-  score.
-
-Run with: `python -m analysis.hypothesis_testing`
-
-`analysis/error_analysis.py`
-```
-Inputs: data/processed/predictions_refined.parquet, merged_dataset.csv,
-        model_features.parquet
-Outputs: data/processed/error_analysis.json
-         data/processed/figures/{confusion_matrix_market_text,feature_importance,
-                                  error_rate_vs_news_volume}.png
-```
-- **Contingency breakdown** -- of holdout days, how many does `market_text_full` get
-  right that `market_only` gets wrong (and vice versa) -- the concrete version of
-  what McNemar's test above scores statistically.
-- **Misclassification profile** -- compares news volume, sentiment surprise, and
-  theme-group counts on days the best model gets wrong vs. right, and whether errors
-  cluster on unusually large moves.
-- **Feature importance** -- LightGBM gain-based importance for `market_text_full`,
-  refit once on the full pre-holdout window (not a new evaluation).
-- **Case studies** -- the 5 largest single-day USD/IDR moves in the holdout, with
-  what was predicted and what the news looked like that day.
-
-Run with: `python -m analysis.error_analysis`
-
-**Results** (run against the current 2024-window-scored data -- see Phase 3's
-"Critical caveat"; re-run both scripts once the full 5-year IndoBERT re-score
-finishes to get holdout-period-valid numbers):
-
-- **McNemar's test**: `market_only` -> `market_text_full` (LightGBM) is the closest
-  to significant of the three pairs tested (p=0.078, holdout accuracy 0.574 ->
-  0.621) but doesn't clear p<0.05; the LogReg version and the sentiment-only ->
-  full-text comparison show no difference at all (p=1.0) -- expected, given the
-  holdout has zero news coverage (Phase 3 caveat).
-- **Logistic-regression significance** (fit on the full pre-holdout window, which
-  does include real 2024 news): `id_title_sent_mean` is the one news feature with a
-  statistically significant coefficient (p=0.0087, coef=-0.94 on standardized
-  values) -- notably **negative**, i.e. more-positive same-day headlines associate
-  with USD/IDR strengthening (rupiah direction down) the next day, not weakening.
-  Pseudo-R² is low (0.016), so this is a real but small effect, not a strong
-  predictor on its own -- consistent with the CV-level result above.
-- **Error analysis** (`market_text_full`, LightGBM, on holdout): of 195 holdout days,
-  both models agree 174 times (106 both-right, 68 both-wrong); `market_text_full`
-  uniquely gets 15 right that `market_only` misses, `market_only` uniquely gets 6 --
-  net in `market_text_full`'s favor, but on a holdout with no news features present,
-  this is model variance, not evidence of news adding signal (see Phase 3 caveat
-  again). Feature importance for `market_text_full` is dominated entirely by market
-  columns (USD/THB, VIX, DXY, USD/MYR, Brent lead) -- unsurprising, since text
-  features are constant zero for the whole holdout the model was evaluated on.
-
-**Verdict on the hypothesis, as it stands today**: the data currently available
-supports a **weak, not-yet-significant** version of the hypothesis -- same-day
-Indonesian news sentiment has a real (p<0.01) but small (pseudo-R²=0.016)
-relationship with next-day USD/IDR direction, and adding text features to market
-data nudges cross-validated accuracy and MCC up slightly (0.548->0.555 accuracy,
-0.086->0.102 MCC) without reaching statistical significance in the paired model
-comparison. The apparent 4.7-point holdout accuracy gain is **not valid evidence**
-either way, since the holdout period has no news coverage in the current data. A
-clean re-run after finishing the 5-year IndoBERT re-score (Phase 3) is needed before
-treating any holdout-level number as a real test of the hypothesis.
-
-**Known limitations carried into the final report** (see earlier phases for detail):
-the global/FinBERT half of the hypothesis was never pulled (BigQuery billing never
-enabled); article bodies were only scraped for 2024; **headline-level sentiment
-scoring also only covers 2024-01 through 2025-01 in this run** -- the extension to
-the full 2021-2026 headline set (245,162 rows, already filtered and ready) was
-started but not completed under time constraints, which is why the holdout window
-above has zero news coverage; Kontan has no GDELT translingual coverage before
-2023-03; and CNBC Indonesia has no GDELT coverage at all.
+---
+
+## 1. News source and why
+
+**GDELT** (one of the allowed sources) is the discovery index and metadata layer. Its translingual GKG feed gives every article's URL, original-language headline, capture timestamp, GDELT topic themes, and tone across the whole 5-year window, without fetching a page. Full text is then scraped from the publishers for a capped subset.
+
+- **Why not scrape whole sites:** a domain-wide crawl (via the Wayback Machine CDX API) was tried first. It hit 504 timeouts, needed about 1M requests, and Kontan URLs carry no date. GDELT solves discovery and dating in one query.
+- **Why Indonesian outlets (Bisnis.com, Kontan.co.id):** the target is USD/IDR, so we want the news the Indonesian market actually reads, including its coverage of global geopolitical events (wars, sanctions, Fed policy, trade disputes).
+- **CNBC Indonesia** was planned but has **zero** rows in GDELT's translingual feed, so it was dropped (a data-availability fact, not a bug). **Kontan** is only indexed from March 2023.
+- The global English-outlet pull (Reuters, AP, BBC, …) is implemented in `src/gdelt/queries/global_headlines.sql` but was **not run**: the BigQuery free-tier quota was used up by the Indonesian pulls.
+
+## 2. Scraping technique
+
+- Discovery with a **BigQuery SQL query** on `gdelt-bq.gdeltv2.gkg_partitioned`, filtered by domain and date partition to keep the scanned bytes low.
+- Full text with **per-site parsers** (`src/scrapers/`) on `requests` + `BeautifulSoup`:
+  - a random 1–3 s delay between requests, retries with backoff, and an identifying User-Agent
+  - JSONL checkpointing, so a killed run resumes where it stopped
+  - a failed-URL log (`_failed.jsonl`)
+- A cap of **15 articles per site per day** (picked deterministically by URL hash) keeps scraping to about 40k URLs instead of 245k. Headline coverage stays complete. Bodies were scraped for the 2024 pilot year (10,594 articles).
+
+## 3. Filtering strategy
+
+| Stage | Rows kept |
+|---|---|
+| Raw GDELT pull | 492,777 |
+| URL dedupe (strip query string, `/amp/`, trailing slash) | 492,750 |
+| **Section filter**: keep national, international, economy, market and finance channels; drop lifestyle, sport, regional editions, press releases, personal finance, etc. | 252,302 |
+| **Theme filter**: keep articles tagged with GDELT themes `ECON_`, `EPU_`, `TRADE`, `ARMEDCONFLICT`, `MILITARY`, `SANCTIONS`, `CRISISLEX`, `TAX_FNCACT` | 245,162 |
+| Empty-title drop + cross-site title dedupe | 244,823 |
+| Aligned to a trading day in range | 243,844 |
+
+The section filter does most of the work. The theme filter is a light second pass (about 3% dropped). Full counts are in `data/processed/filter_report.json`.
+
+## 4. Cleaning and preprocessing
+
+What we **kept**:
+
+- the headline, the article body, GDELT themes (unique names only), GDELT document tone, source, section, URL, and the exact timestamp
+
+What we **dropped or changed**:
+
+- **HTML entities** are unescaped and whitespace is normalised.
+- **Boilerplate lines** in bodies are removed with per-site regexes: bylines ("Reporter: … | Editor: …"), "Baca Juga" link blocks, and subscription and follow-us promos.
+- **Bodies under 200 characters** are dropped. These are failed parses or paywall stubs.
+- **Duplicates across sites** are removed by normalised title (keeping the earliest).
+- **Theme character offsets** are stripped (`ECON_INFLATION,693;ECON_INFLATION,812` becomes `ECON_INFLATION`).
+
+We deliberately do **not** lowercase, stem, or remove stopwords here. Those choices depend on the NLP method chosen in Task 2, so the dataset keeps the original text.
+
+## 5. Exchange rate: Bank Indonesia JISDOR
+
+- **Source:** Bank Indonesia's **JISDOR** (Jakarta Interbank Spot Dollar Rate), the official daily USD/IDR reference rate. Downloaded as Excel from [bi.go.id → Statistik → Informasi Kurs → JISDOR](https://www.bi.go.id/id/statistik/informasi-kurs/jisdor/default.aspx) and saved to `data/raw/jisdor/jisdor_raw.xlsx`. BI's site blocks scripted access, so this step is manual. A copy is committed in `data/raw_sample/`.
+- **Trading calendar:** BI publishes JISDOR only on Indonesian business days. The JISDOR dates therefore *are* the trading calendar, and weekends, public holidays and *cuti bersama* are excluded automatically. We do **not** forward-fill fake rates onto non-trading days.
+- Derived columns: `pct_change`, `log_return`, `direction` (+1 means IDR weakened, −1 means IDR strengthened, 0 means flat), and `calendar_days_since_prev` (3 on a Monday, more after holidays).
+
+## 6. Alignment rule: news time vs. trading days
+
+JISDOR is fixed once per business day and **published at 10:00 WIB** (`config.yaml → alignment.cutoff_time_wib`). All timestamps are converted from GDELT's UTC to **WIB (UTC+7)**, because IDR trades in Jakarta.
+
+**Rule: each article is assigned to the first JISDOR fixing at or after its timestamp.**
+
+| Case | Example | Assigned trading day | Share of articles |
+|---|---|---|---|
+| `same_day`: trading day, before the 10:00 fixing | Tue 08:30 | Tue | 17% |
+| `after_cutoff`: trading day, after the fixing | Tue 14:00 | Wed (next trading day) | 64% |
+| `non_trading_day`: weekend or public holiday | Sat 11:00, or Idul Fitri | next trading day (e.g. Mon) | 19% |
+
+Why this rule:
+
+1. **No look-ahead leakage.** An article is only ever linked to a rate fixed *after* it appeared, so it can never "explain" a rate that was already known.
+2. **No news is thrown away.** Weekend and holiday news piles onto the next fixing, which is the first moment the market can react to it.
+3. **Conservative timestamps.** GDELT timestamps are *capture* times in 15-minute batches, always at or slightly after real publication, so any error pushes an article later, never earlier.
+
+The rule is verified in code: for every article, its fixing is at or after the article's timestamp, and the previous fixing is before it. Counts are in `data/processed/alignment_report.json`.
+
+---
+
+## Output data
+
+`data/processed/final_dataset.csv` is the main deliverable: **one row per JISDOR trading day** (1,202 rows).
+
+| Column | Meaning |
+|---|---|
+| `date` | trading day (JISDOR fixing date) |
+| `jisdor_rate` | IDR per USD |
+| `pct_change`, `log_return` | change vs. previous fixing |
+| `direction` | +1 up (IDR weaker), −1 down (IDR stronger), 0 flat |
+| `calendar_days_since_prev` | gap since previous fixing (weekends/holidays) |
+| `n_articles`, `n_bisnis`, `n_kontan` | articles aligned to this day, total and per source |
+| `n_with_body` | how many of them have scraped full text |
+| `n_non_trading_day_articles` | how many came from a weekend/holiday before this day |
+| `gdelt_tone_mean` | mean GDELT document tone of those articles |
+| `titles` | all aligned headlines, oldest first, joined with `" \|\| "` |
+
+Other files:
+
+- `data/processed/articles_aligned/articles_<year>.parquet`: one row per article (`article_id`, `timestamp_wib`, `calendar_date_wib`, `trading_date`, `alignment_case`, `source`, `section`, `url`, `title`, `body`, `has_body`, `themes`, `gdelt_tone`). Load the whole folder with `pd.read_parquet("data/processed/articles_aligned")`.
+- `data/processed/usd_idr_jisdor.csv`: the clean JISDOR series.
+- `data/processed/filter_report.json` and `alignment_report.json`: stage counts.
+- `data/raw_sample/`: raw GDELT rows, raw scraped articles, and the raw JISDOR export.
+
+No sentiment or other NLP features are computed in Task 1. Feature extraction belongs to Task 2.
+
+## Known limitations
+
+- **News gap from Aug 2022 to Jan 2023.** GDELT's own coverage of these domains collapses to about 500 rows per month (normally about 7,000), leaving 133 trading days (late Jul 2022 to Jan 2023) with zero news. There are 11 more zero-news days in Jun–Jul 2025, for 144 in total. This comes from the source (visible in the raw pull), not from our filters.
+- **Kontan** is only indexed by GDELT from March 2023. Before that, all news is from Bisnis.
+- **Full-text bodies exist for 2024 only** (10,594 articles). Headlines cover all 5 years.
+- **Global English outlets were not pulled** (BigQuery quota). The dataset tests the hypothesis through Indonesian financial media's coverage of global events.
