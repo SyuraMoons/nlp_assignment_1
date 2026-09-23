@@ -1,8 +1,20 @@
+# Python
 __pycache__/
 *.pyc
 .venv/
 venv/
 .env
-
 .ipynb_checkpoints/
 .DS_Store
+
+# Full raw pulls and intermediate tables: large and fully reproducible from src/.
+# Small samples of every raw source are committed in data/raw_sample/ instead.
+data/raw/
+data/interim/
+
+# Local-only folders (later-phase work kept out of the Task 1 repo; tool worktrees)
+_archive_later_phases/
+.kilo/
+
+# Assignment brief
+*.pdf

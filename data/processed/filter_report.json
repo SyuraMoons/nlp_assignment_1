@@ -1,3 +1,71 @@
-version https://git-lfs.github.com/spec/v1
-oid sha256:07a3611669a6f0837a9462c341b81171e1cdd3306f32745dab46143a8d1146ee
-size 1460
+{
+  "stages": [
+    {
+      "stage": "raw_pulled",
+      "count": 492777
+    },
+    {
+      "stage": "after_url_dedupe",
+      "count": 492750
+    },
+    {
+      "stage": "after_section_filter",
+      "count": 252302,
+      "dropped_sections_sample": {
+        "finansial": 34729,
+        "momsmoney": 22661,
+        "lifestyle": 21639,
+        "insight": 18839,
+        "bola": 15620,
+        "koran": 13659,
+        "sumatra": 12827,
+        "bandung": 12426,
+        "teknologi": 12225,
+        "pressrelease": 8043,
+        "jakarta": 7421,
+        "otomotif": 7376,
+        "foto": 7051,
+        "surabaya": 6918,
+        "semarang": 5743,
+        "entrepreneur": 4222,
+        "industri": 4083,
+        "bali": 3696,
+        "hijau": 3228,
+        "premium": 2487
+      }
+    },
+    {
+      "stage": "after_theme_filter",
+      "count": 245162
+    },
+    {
+      "stage": "scrape_queue_after_daily_cap",
+      "count": 39837,
+      "daily_cap_per_site": 15
+    },
+    {
+      "stage": "id_headlines_raw",
+      "count": 245162
+    },
+    {
+      "stage": "id_headlines_after_empty_title_drop",
+      "count": 245162
+    },
+    {
+      "stage": "id_headlines_after_cross_site_title_dedupe",
+      "count": 244823
+    },
+    {
+      "stage": "global_headlines_raw",
+      "count": 0
+    },
+    {
+      "stage": "bodies_scraped",
+      "count": 10594
+    },
+    {
+      "stage": "bodies_after_boilerplate_and_length_filter",
+      "count": 10594
+    }
+  ]
+}

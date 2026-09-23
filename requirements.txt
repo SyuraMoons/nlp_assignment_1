@@ -1,19 +1,15 @@
+# Task 1 pipeline (Python 3.10+)
+pandas
+numpy
+pyarrow
+pyyaml
+openpyxl            # read Bank Indonesia's JISDOR Excel export
 requests
 beautifulsoup4
 lxml
-python-dateutil
-pyyaml
-pandas
 tqdm
-transformers
-torch
-google-cloud-bigquery
+python-dateutil
+google-cloud-bigquery   # GDELT pull (src/gdelt/fetch.py)
 db-dtypes
-pyarrow
 matplotlib
 jupyter
-yfinance
-scikit-learn
-lightgbm
-sentence-transformers
-statsmodels
